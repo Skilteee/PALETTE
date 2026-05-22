@@ -62,7 +62,7 @@ pip install -r requirements.txt
 
 ## Training
 
-### LLM Per-Layer Ablation Training
+### LLM Training
 
 ```bash
 python main.py \
@@ -84,7 +84,7 @@ python main.py \
   --output_dir ./log/llama3-cyber/
 ```
 
-### VLM Per-Layer Ablation Training
+### VLM Training
 
 ```bash
 python main.py \
