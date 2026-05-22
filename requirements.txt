@@ -1,0 +1,13 @@
+torch>=2.1.0
+transformers>=4.45.0
+datasets>=2.19.0
+accelerate>=1.0.0
+peft>=0.5.0
+tqdm>=4.65.0
+numpy>=1.24.0
+jaxtyping>=0.2.0
+termcolor>=2.0.0
+Pillow>=10.0.0
+lm-eval>=0.4.0
+vllm>=0.6.3
+qwen-vl-utils>=0.0.2
