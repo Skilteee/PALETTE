@@ -39,10 +39,6 @@ PALETTE/
 ## Setup
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd PALETTE
-
 # Create environment
 conda create -n palette python=3.10 -y
 conda activate palette
