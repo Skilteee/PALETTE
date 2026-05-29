@@ -879,7 +879,7 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        default='./data/strongreject_Disinformation_test.json',
+        default='./data/genharm_Disinformation_test.json',
         help="AdvBench harmful data source (json file path or datasets name)",
     )
     parser.add_argument("--limit", type=int, default=200)
@@ -911,7 +911,7 @@ def main():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default='strongreject',
+        default='genharm',
         help="comma-separated dataset paths for disallow prompts",
     )
     parser.add_argument(

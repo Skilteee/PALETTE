@@ -7,7 +7,6 @@ from utils.utils import evaluate
 import logging
 logging.getLogger("lm_eval").setLevel(logging.ERROR)
 import argparse
-import sys
 
 
 def _unwrap_state_dict(state):

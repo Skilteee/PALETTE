@@ -31,7 +31,7 @@ PALETTE/
 │   ├── dataset_utils.py        # MMMU dataset processing
 │   ├── eval_utils.py           # Evaluation judge utilities
 │   └── common_utils.py         # Common utilities
-├── data/                       # Datasets (wmdp, strongreject, cosapien, etc.)
+├── data/                       # Datasets (wmdp, genharm, cosapien, etc.)
 ├── data_benign.json            # Benign prompts for safe data
 └── requirements.txt
 ```
@@ -53,7 +53,7 @@ pip install -r requirements.txt
 
 2. **Datasets**: Place datasets under `./data/`:
    - `wmdp/` — WMDP benchmark (cyber, bio, chem categories)
-   - `strongreject/` — StrongReject benchmark (Violence, Hate, Sexual, etc.)
+   - `genharm/` — GenHarm benchmark (Violence, Hate, Sexual, etc.)
    - `MMBench/` — MM-SafetyBench for VLM evaluation (optional)
 
 ## Training
@@ -104,7 +104,7 @@ python main.py \
 | Argument | Description |
 |----------|-------------|
 | `--model` | HuggingFace model name or local path |
-| `--dataset_name` | Dataset: `wmdp`, `strongreject`, or custom |
+| `--dataset_name` | Dataset: `wmdp`, `genharm`, or custom |
 | `--target_types` | Categories to allow (space-separated) |
 | `--direction_path` | Path to pre-computed `mean_diffs.pt` |
 | `--target_layer` | Layer index for ablation |
