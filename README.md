@@ -20,6 +20,7 @@ The repository also includes the Llama-3.1-8B-Instruct refusal-direction tensor.
 - [Evaluation](#evaluation)
   - [Selective Refusal](#selective-refusal)
   - [General Capabilities](#general-capabilities)
+- [Citation](#citation)
 
 ## Getting Started
 
@@ -197,4 +198,16 @@ python eval/eval_gsm8k.py \
   --lora_path artifacts/Llama-2-7b-chat-hf/lora_layer_14_Hate.pth \
   --lora_layer 14 \
   --tasks gsm8k
+```
+
+
+## Citation
+
+```bash
+@article{tan2026palette,
+  title={Palette: A Modular, Controllable, and Efficient Framework for On-demand Authorized Safety Alignment Relaxation in LLMs},
+  author={Tan, Qitao and Song, Xiaoying and Akbari, Arman and Akbari, Arash and Wang, Yanzhi and Zhai, Xiaoming and Hong, Lingzi and Xiang, Zhen and Lu, Jin and Yuan, Geng},
+  journal={arXiv preprint arXiv:2605.24154},
+  year={2026}
+}
 ```
