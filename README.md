@@ -1,8 +1,6 @@
 # PALETTE
 
-Code and released checkpoints for per-layer refusal-direction ablation with
-LoRA. The current release targets Llama-2-7b-chat-hf and the five GenHarm
-categories.
+This repository contains the official implementation of PALETTE, a method for selectively relaxing safety refusal in large language models (LLMs) and vision-language models (VLMs) through per-layer direction ablation with LoRA.
 
 ## Table of Contents
 
