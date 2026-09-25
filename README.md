@@ -1,7 +1,6 @@
 # PALETTE
 
-This repository contains the official implementation of PALETTE, a method for selectively relaxing safety refusal in large language models (LLMs) and vision-language models (VLMs) through per-layer direction ablation with LoRA.
-The repository also includes the Llama-3.1-8B-Instruct refusal-direction tensor.
+This repository contains the official implementation of Palette, a modular, controllable, and efficient framework that selectively relaxes refusal behavior on authorized target domains while preserving standard safety elsewhere. Our method identifies a refusal direction via multi-objective search and internalizes it into the model through lightweight adaptation. Palette further supports modular composition: it learns domain-specific safety controls independently and composes them through parameter merging, enabling on-demand multi-domain authorization without retraining.
 
 ## News
 
