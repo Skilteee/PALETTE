@@ -207,6 +207,8 @@ def ablation_train(
 
     eval_interval = max(1, getattr(args, "eval_interval", 1))
     eval_mapping = {"allowed": False, "safe": False, "disallowed": True}
+    if not dataloader:
+        raise ValueError("Training dataloader is empty")
     args.nsamples = len(dataloader)
 
     model = lm.model
@@ -376,7 +378,35 @@ def ablation_train(
     # Load refusal direction vector from args
     target_layer = args.target_layer
     pos = args.direction_pos
-    vector = torch.load(args.direction_path)[pos, target_layer, :].to(device=dev, dtype=dtype)
+    direction_tensor = torch.load(
+        args.direction_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(direction_tensor, torch.Tensor) or direction_tensor.ndim != 3:
+        raise ValueError(
+            "--direction_path must contain a [positions, layers, hidden_dim] tensor"
+        )
+    if not 0 < target_layer < len(layers):
+        raise ValueError(
+            f"--target_layer must be in [1, {len(layers) - 1}], got {target_layer}"
+        )
+    if target_layer >= direction_tensor.shape[1]:
+        raise ValueError(
+            f"Direction tensor has only {direction_tensor.shape[1]} layers, "
+            f"but --target_layer is {target_layer}"
+        )
+    if not -direction_tensor.shape[0] <= pos < direction_tensor.shape[0]:
+        raise ValueError(
+            f"--direction_pos must be in "
+            f"[-{direction_tensor.shape[0]}, {direction_tensor.shape[0] - 1}], got {pos}"
+        )
+    if direction_tensor.shape[2] != model.config.hidden_size:
+        raise ValueError(
+            f"Direction hidden size {direction_tensor.shape[2]} does not match "
+            f"model hidden size {model.config.hidden_size}"
+        )
+    vector = direction_tensor[pos, target_layer, :].to(device=dev, dtype=dtype)
 
     train_layer_idx = target_layer - 1
     fp_ablation_layers = [train_layer_idx]
@@ -401,7 +431,7 @@ def ablation_train(
         sample_losses = masked_token_losses.sum(dim=1) / valid_token_count
         return sample_losses.mean(), sample_losses
 
-    best_sucess_rate = 0.0
+    best_success_rate = -1.0
 
     # Layer-wise training loop
     for i in range(len(layers)):
@@ -551,7 +581,10 @@ def ablation_train(
                 do_eval = (
                     eval_dataloader is not None
                     and len(eval_dataloader) > 0
-                    and ((epochs + 1) % eval_interval == 0)
+                    and (
+                        (epochs + 1) % eval_interval == 0
+                        or (epochs + 1) == args.epochs
+                    )
                 )
                 if do_eval:
                     layers[i] = layer
@@ -574,11 +607,16 @@ def ablation_train(
                         )
                         logger.info(f'[eval] refusal: {per_class_refusal}')
 
-                        if eval_stats['success_rate'] > best_sucess_rate:
-                            best_sucess_rate = eval_stats['success_rate']
+                        if eval_stats['success_rate'] > best_success_rate:
+                            best_success_rate = eval_stats['success_rate']
                             lora_state = extract_lora_state_dict(layer)
-                            torch.save(lora_state, os.path.join(args.output_dir, f"best_lora_layer_{i}.pth"))
-                            logger.info(f"New best success rate: {best_sucess_rate:.4f}, saved best_lora_layer_{i}.pth")
+                            target_name = "_".join(args.target_types)
+                            checkpoint_name = f"lora_layer_{i}_{target_name}.pth"
+                            torch.save(lora_state, os.path.join(args.output_dir, checkpoint_name))
+                            logger.info(
+                                f"New best success rate: {best_success_rate:.4f}, "
+                                f"saved {checkpoint_name}"
+                            )
                     finally:
                         for k in range(len(layers)):
                             if k != i:

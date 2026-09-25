@@ -125,7 +125,6 @@ class LM(abc.ABC):
         """
         pass
 
-    # TODO: Add an optional max length
     @abstractmethod
     def greedy_until(self, requests):
         """Generate greedily until a stopping sequence
@@ -203,8 +202,8 @@ class BaseLM(LM):
         """
         pass
 
-    # subclass must implement properties vocab_size, eot_token_id, max_gen_toks, batch_size, device, max_length.
-    # TODO: enforce this somehow
+    # Subclasses implement vocab_size, eot_token_id, max_gen_toks, batch_size,
+    # device, and max_length.
 
     def loglikelihood(self, requests):
         new_reqs = []
@@ -221,9 +220,6 @@ class BaseLM(LM):
         return self._loglikelihood_tokens(new_reqs)
 
     def loglikelihood_rolling(self, requests):
-        # TODO: Implement caching once we've confirmed the perplexity implementation
-        # TODO: automatic batch size detection for vectorization
-
         loglikelihoods = []
         for (string,) in tqdm(requests):
             rolling_token_windows = list(
@@ -240,8 +236,6 @@ class BaseLM(LM):
 
             rolling_token_windows = [(None,) + x for x in rolling_token_windows]
 
-            # TODO: extract out this call so it only gets called once and also somehow figure out partial caching for
-            # that
             string_nll = self._loglikelihood_tokens(
                 rolling_token_windows, disable_tqdm=True
             )
@@ -255,9 +249,7 @@ class BaseLM(LM):
         return loglikelihoods
 
     def _loglikelihood_tokens(self, requests, disable_tqdm=False):
-        # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
         res = []
-        dataset_inps = []
 
         def _collate(x):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
@@ -270,7 +262,6 @@ class BaseLM(LM):
             toks = x[1] + x[2]
             return -len(toks), tuple(toks)
 
-        # TODO: automatic (variable) batch size detection for vectorization
         re_ord = Reorderer(requests, _collate)
         for chunk in chunks(
             tqdm(re_ord.get_reordered(), disable=disable_tqdm), self.batch_size
@@ -326,76 +317,13 @@ class BaseLM(LM):
                 inps.append(inp.unsqueeze(0))  # [1, padding_length]
                 cont_toks_list.append(cont)
                 inplens.append(inplen)
-            # import pdb; pdb.set_trace()
             batched_inps = torch.cat(inps, dim=0).to(
                 self.device
             )  # [batch, padding_length
 
-            # self.model = self.model.to(self.device)
             multi_logits = F.log_softmax(
                 self._model_call(batched_inps), dim=-1
             ).cpu()  # [batch, padding_length, vocab]
-
-            # dataset_inps.append(batched_inps)
-            # dataset_logits = self._model_logits_on_dataset(dataset_inps)
-            # iter = 0
-            # for chunk in chunks(
-            #         tqdm(re_ord.get_reordered(), disable=disable_tqdm), self.batch_size
-            # ):
-            #     multi_logits = dataset_logits[iter]
-            #     iter+=1
-            #     inps = []
-            #     cont_toks_list = []
-            #     inplens = []
-            #
-            #     padding_length = None
-            #
-            #     # because vectorizing is annoying, we first convert each (context, continuation) pair to padded
-            #     # tensors, then we pack them together into a batch, call the model, and then pick it all apart
-            #     # again because vectorizing is annoying
-            #
-            #     # todo: check if we realy nead the following loop
-            #     for _, context_enc, continuation_enc in chunk:
-            #         # sanity check
-            #         assert len(context_enc) > 0
-            #         assert len(continuation_enc) > 0
-            #         assert len(continuation_enc) <= self.max_length
-            #
-            #         # how this all works:
-            #         #          CTX      CONT
-            #         # inp    0 1 2 3|4 5 6 7 8 9   <- last token is deleted by inp[:, :-1]
-            #         # gpt2    \               \
-            #         # logits   1 2 3|4 5 6 7 8 9   <- the ctx half gets tossed out by the
-            #         # cont_toks      4 5 6 7 8 9      [:, -len(continuation_enc):, :self.vocab_size] slice
-            #
-            #         # when too long to fit in context, truncate from the left
-            #         inp = torch.tensor(
-            #             (context_enc + continuation_enc)[-(self.max_length + 1):][:-1],
-            #             dtype=torch.long,
-            #         ).to(self.device)
-            #         (inplen,) = inp.shape
-            #
-            #         cont = continuation_enc
-            #
-            #         # since in _collate we make sure length is descending, the longest is always the first one.
-            #         padding_length = (
-            #             padding_length if padding_length is not None else inplen
-            #         )
-            #
-            #         # pad length from seq to padding_length
-            #         inp = torch.cat(
-            #             [
-            #                 inp,  # [seq]
-            #                 torch.zeros(padding_length - inplen, dtype=torch.long).to(
-            #                     inp.device
-            #                 ),  # [padding_length - seq]
-            #             ],
-            #             dim=0,
-            #         )
-            #
-            #         inps.append(inp.unsqueeze(0))  # [1, padding_length]
-            #         cont_toks_list.append(cont)
-            #         inplens.append(inplen)
 
             for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
                 chunk, multi_logits, inps, inplens, cont_toks_list
@@ -412,11 +340,9 @@ class BaseLM(LM):
                 cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
                     0
                 )  # [1, seq]
-                # import pdb; pdb.set_trace()
                 max_equal = (greedy_tokens == cont_toks).all()
 
                 # Obtain log-probs at the corresponding continuation token indices
-                # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
                 logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
                     -1
                 )  # [1, seq]
@@ -432,11 +358,6 @@ class BaseLM(LM):
         return re_ord.get_original(res)
 
     def greedy_until(self, requests):
-        print("greedy utils in base...")
-        # TODO: implement fully general `until` that handles until that are
-        #       multiple tokens or that span multiple tokens correctly
-
-        # TODO: extract to TokenizedLM?
         res = []
 
         def _collate(x):

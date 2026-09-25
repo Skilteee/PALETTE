@@ -1,13 +1,7 @@
-import transformers
-import torch
-from .models_utils import BaseLM, find_layers
+from .models_utils import BaseLM
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 import torch.nn.functional as F
-from torch import nn
 import torch
-from tqdm import tqdm
-import pdb
-from peft import PeftModel
 
 class LMClass(BaseLM):
     def __init__(self, args):
@@ -27,12 +21,22 @@ class LMClass(BaseLM):
         padding_side = "right" if 'qwen' not in args.model.lower() else "left"
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side=padding_side)
 
-        self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',
-                                                              torch_dtype=torch.bfloat16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            config=config,
+            device_map="cpu",
+            dtype=torch.bfloat16,
+        )
 
         if args.model_resume:
-            self.model = PeftModel.from_pretrained(self.model, args.model_resume, device_map='cpu',
-                                                  torch_dtype=torch.bfloat16)
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(
+                self.model,
+                args.model_resume,
+                device_map="cpu",
+                dtype=torch.bfloat16,
+            )
             self.model = self.model.merge_and_unload()
 
 
@@ -60,17 +64,14 @@ class LMClass(BaseLM):
 
     @property
     def max_gen_toks(self):
-        print("max_gen_toks fn")
         return 256
 
     @property
     def batch_size(self):
-        # TODO: fix multi-gpu
-        return self.batch_size_per_gpu  # * gpus
+        return self.batch_size_per_gpu
 
     @property
     def device(self):
-        # TODO: fix multi-gpu
         return self._device
 
     def tok_encode(self, string: str):

@@ -1,16 +1,13 @@
 import os
-import sys
 import random
 import numpy as np
 import torch
 import time
 from types import SimpleNamespace
-import torch.nn as nn
 from ablation.ablation_train import ablation_train
 import utils
 from pathlib import Path
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
 from datasets import load_dataset
 from models.LMClass import LMClass
 
@@ -25,22 +22,29 @@ def apply_chat_template(tokenizer, user_text: str) -> str:
          "content": "Below is an instruction that describes a task. Write a response that appropriately completes the request."},
         {"role": "user", "content": user_text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    system_prompt = messages[0]["content"]
+    return f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_text} [/INST] "
 
 
-def build_genharm_ablation_split(dataset_name, target_type, test_ratio, train_ratio, split_seed):
+def build_ablation_split(dataset_name, target_type, test_ratio, train_ratio, split_seed):
     base_dir = Path(f"./data/{dataset_name}")
-    dual_path = base_dir / f"{dataset_name}_{target_type}_test_dual.json"
-    train_path = base_dir / f"{dataset_name}_{target_type}_train.json"
+    dual_path = base_dir / f"{dataset_name}_{target_type}_train_dual.json"
+    test_path = base_dir / f"{dataset_name}_{target_type}_test.json"
 
     with dual_path.open("r", encoding="utf-8") as f:
         dual_data = json.load(f)
-    with train_path.open("r", encoding="utf-8") as f:
-        train_data = json.load(f)
+    with test_path.open("r", encoding="utf-8") as f:
+        test_data = json.load(f)
 
     merged = []
     merged.extend(dual_data)
-    merged.extend(train_data)
+    merged.extend(test_data)
 
     rng = random.Random(split_seed)
     rng.shuffle(merged)
@@ -182,7 +186,7 @@ def get_vlm_dataloader(args, lm, target_types, ratio, all_types):
     allowed_data = []
 
     for target_type in target_types:
-        with open(f"./data/MMBench/processed_questions/{target_type}_test.json", "r", encoding="utf-8") as f:
+        with open(f"./data/MMBench/processed_questions/{target_type}_train.json", "r", encoding="utf-8") as f:
             data = json.load(f)
             random.shuffle(data)
             allowed_data.extend(data)
@@ -233,7 +237,7 @@ def get_vlm_dataloader(args, lm, target_types, ratio, all_types):
     eval_dataloader = []
     system_prompt = args.vlm_system_prompt
     for category in eval_set:
-        with open(f"./data/MMBench/processed_questions/{category}_train.json", "r", encoding="utf-8") as f:
+        with open(f"./data/MMBench/processed_questions/{category}_test.json", "r", encoding="utf-8") as f:
             data = json.load(f)
             eval_prompts = [d.get('Changed Question', None) for d in data[:limit]]
             eval_images = [Image.open(d.get('image', None)).convert("RGB") for d in data[:limit]]
@@ -263,12 +267,12 @@ torch.backends.cudnn.benchmark = True
 
 
 def get_dataloader(args, lm, dataset_name, target_types, ratio):
-    if dataset_name in ['wmdp', 'genharm']:
+    if dataset_name:
         allowed_data = []
         ablation_eval_map = {}
-        if dataset_name == "genharm" and args.sr_ablation:
+        if args.sr_ablation:
             for idx, target_type in enumerate(target_types):
-                train_pool, test_pool = build_genharm_ablation_split(
+                train_pool, test_pool = build_ablation_split(
                     dataset_name=dataset_name,
                     target_type=target_type,
                     test_ratio=args.sr_test_ratio,
@@ -278,22 +282,23 @@ def get_dataloader(args, lm, dataset_name, target_types, ratio):
                 allowed_data.extend(train_pool)
                 ablation_eval_map[target_type] = test_pool
                 print(
-                    f"[genharm-ablation] {target_type}: "
+                    f"[ablation-split] {target_type}: "
                     f"train={len(train_pool)}, test={len(test_pool)}"
                 )
         else:
             for target_type in target_types:
-                with open(f"./data/{dataset_name}/{dataset_name}_{target_type}_test.json", "r", encoding="utf-8") as f:
+                with open(f"./data/{dataset_name}/{dataset_name}_{target_type}_train.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
                     random.shuffle(data)
                     allowed_data.extend(data)
 
         random.shuffle(allowed_data)
-        num_allow = len(allowed_data) * ratio[0]
+        num_allow = int(len(allowed_data) * ratio[0])
+        allowed_data = allowed_data[:num_allow]
         prompts = [d.get('prompt', None) or d.get('question', None) for d in allowed_data]
         labels = ['allowed' for _ in range(len(allowed_data))]
 
-        with open(f'./data/{dataset_name}_test.json', 'r') as f:
+        with open(f'./data/{dataset_name}/{dataset_name}_train.json', 'r') as f:
             data = json.load(f)
             random.shuffle(data)
 
@@ -318,22 +323,26 @@ def get_dataloader(args, lm, dataset_name, target_types, ratio):
         prompts.extend(safe_prompts)
         labels.extend(['safe' for _ in range(len(safe_prompts))])
 
-        eval_set = ['chem', 'bio', 'cyber']
+        prefix = f"{dataset_name}_"
+        suffix = "_test.json"
+        eval_set = sorted(
+            path.name[len(prefix):-len(suffix)]
+            for path in (Path("data") / dataset_name).glob(f"{dataset_name}_*_test.json")
+        )
         for target_type in target_types:
             if target_type not in eval_set:
                 eval_set.append(target_type)
-        limit = 150
+        limit = None if args.limit < 0 else args.limit
         eval_dataloader = []
         for dataset in eval_set:
-            if dataset_name == "genharm" and args.sr_ablation and dataset in target_types:
+            if args.sr_ablation and dataset in target_types:
                 data = ablation_eval_map.get(dataset, [])
                 eval_prompts = [d.get('prompt', None) or d.get('question', None) for d in data]
             else:
-                with open(f"./data/{dataset_name}/{dataset_name}_{dataset}_train.json", "r", encoding="utf-8") as f:
+                with open(f"./data/{dataset_name}/{dataset_name}_{dataset}_test.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
-                eval_prompts = [d.get('prompt', None) or d.get('question', None) for d in
-                                data[:limit]] if dataset not in target_types else [
-                    d.get('prompt', None) or d.get('question', None) for d in data]
+                selected = data if limit is None else data[:limit]
+                eval_prompts = [d.get('prompt', None) or d.get('question', None) for d in selected]
             eval_dataloader.extend([
                 (eval_prompts[i], '{}_allowed'.format(dataset)) if dataset in target_types else (
                     eval_prompts[i], '{}_disallowed'.format(dataset))
@@ -354,45 +363,6 @@ def get_dataloader(args, lm, dataset_name, target_types, ratio):
         ]
         dataloader = [(prompt_batches[i], labels[i]) for i in range(len(prompt_batches))]
 
-    else:
-        dataloader = []
-        eval_dataloader = []
-
-        for target in target_types:
-            with open(f"./data/{dataset_name}/{target}.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-                random.shuffle(data)
-
-                train_set = data[:int(len(data) * 0.2)]
-                eval_set = data[int(len(data) * 0.2):]
-
-                train_prompts = [d["prompt"] for d in train_set]
-                eval_prompts = [d["prompt"] for d in eval_set]
-
-                train_labels = [d['type'] for d in train_set]
-                eval_labels = [d['type'] for d in eval_set]
-
-                with open(f'data_benign.json', 'r') as f:
-                    data = json.load(f)
-                    random.shuffle(data)
-                safe_prompts = [d["prompt"] for d in data[:int(ratio[2] // 2 * len(train_prompts))]]
-                train_prompts.extend(safe_prompts)
-                train_labels.extend(['safe' for _ in range(len(safe_prompts))])
-
-                prompt_batches = [
-                    lm.tokenizer(
-                        apply_chat_template(lm.tokenizer, text),
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=lm.seqlen,
-                        padding="max_length",
-                    ).to(lm._device)
-                    for text in train_prompts
-                ]
-
-                dataloader.extend([(prompt_batches[i], train_labels[i]) for i in range(len(prompt_batches))])
-                eval_dataloader.extend([(prompt, label) for prompt, label in zip(eval_prompts, eval_labels)])
-
     random.shuffle(dataloader)
     return dataloader, eval_dataloader
 
@@ -403,11 +373,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="model name or model path")
     parser.add_argument("--model_resume", type=str, help="path to existing LoRA adapter to merge")
-    parser.add_argument("--cache_dir", default="./cache", type=str, help="cache dir of dataset")
-    parser.add_argument("--output_dir", default="../log/", type=str, help="direction of logging file")
+    parser.add_argument("--output_dir", default="./log/", type=str, help="directory for logs and trained LoRA checkpoints")
     parser.add_argument("--save_dir", default=None, type=str, help="direction for saving model")
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size.")
     parser.add_argument("--seqlen", type=int, default=128, help="sequence length.")
     parser.add_argument("--seqlen_vision", type=int, default=384, help="sequence length for VLM.")
@@ -417,6 +384,7 @@ def main():
     parser.add_argument("--wd", type=float, default=0, help="weight decay")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--eval_interval", type=int, default=30, help="Evaluate every N epochs during layer training.")
+    parser.add_argument("--skip_ppl_eval", action="store_true", help="Skip WikiText-2 perplexity evaluation after training.")
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--multigpu", action="store_true", help="at eval, map model to multiple gpus")
     parser.add_argument(
@@ -437,22 +405,20 @@ def main():
     parser.add_argument("--text_ablation_scale", type=float, default=2.5)
     parser.add_argument("--vision_ablation_scale", type=float, default=2.5)
     parser.add_argument("--sr_ablation", action="store_true",
-                        help="Use genharm ablation split: merge *_test_dual and *_train, then split by ratio.")
+                        help="Merge *_train_dual and *_test, then re-split by ratio.")
     parser.add_argument("--sr_test_ratio", type=float, default=0.5)
     parser.add_argument("--sr_train_ratio", type=float, default=1.0)
     parser.add_argument("--sr_split_seed", type=int, default=42)
 
-    # Dataset and target configuration
-    parser.add_argument("--dataset_name", type=str, default="genharm", help="Dataset name (e.g., wmdp, genharm)")
+    parser.add_argument("--dataset_name", type=str, default="genharm", help="Dataset directory and filename prefix under ./data")
     parser.add_argument("--target_types", type=str, nargs="+", default=["Disinformation"],
-                        help="Target categories to allow (e.g., cyber, Violence)")
+                        help="Target categories to allow")
     parser.add_argument("--ratio", type=float, nargs=3, default=[1.0, 1.0, 1.0],
                         help="Ratio for [allowed, disallowed, safe] data")
     parser.add_argument("--vlm_all_types", type=str, nargs="+",
                         default=["01-Illegal_Activity", "02-HateSpeech", "04-Physical_Harm", "06-Fraud", "07-Sex", "09-Privacy_Violence"],
                         help="All VLM category types for disallowed pool")
 
-    # Direction ablation configuration
     parser.add_argument("--direction_path", type=str, required=True,
                         help="Path to mean_diffs.pt file containing refusal directions")
     parser.add_argument("--target_layer", type=int, required=True,
@@ -466,28 +432,25 @@ def main():
     if not (0.0 <= args.sr_train_ratio <= 1.0):
         raise ValueError("--sr_train_ratio must be in [0, 1].")
 
-    # init logger
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    if args.cache_dir:
-        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
     if args.save_dir:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
 
-    # load model
     args.net = args.model.split('/')[-1]
-    args.model_family = args.net.split('-')[0]
     args.deactive_amp = False
 
     if args.task_type == "vision":
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=args.trust_remote_code, max_pixels=256 * 28 * 28)
         model = AutoModelForImageTextToText.from_pretrained(
             args.model,
-            torch_dtype=resolve_dtype(args.vlm_dtype),
+            dtype=resolve_dtype(args.vlm_dtype),
             trust_remote_code=args.trust_remote_code,
             device_map='cpu'
         )
@@ -514,7 +477,6 @@ def main():
         lm._device = f"cuda:{gpu_id}"
         logger.info(f"set training on gpu {gpu_id}")
 
-    # prepare data and train
     logger.info("=== start per-layer ablation training ===")
     tick = time.time()
 
@@ -546,7 +508,7 @@ def main():
         lm.model.save_pretrained(args.save_dir)
         lm.tokenizer.save_pretrained(args.save_dir)
 
-    if args.task_type == "text":
+    if args.task_type == "text" and not args.skip_ppl_eval:
         utils.evaluate(lm.model, args.model)
 
 
@@ -562,6 +524,5 @@ def set_seed(seed=None):
 
 
 if __name__ == "__main__":
-    print(sys.argv)
     set_seed()
     main()

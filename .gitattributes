@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep PyTorch checkpoints as regular Git binary files.
+*.pt -text
+*.pth -text

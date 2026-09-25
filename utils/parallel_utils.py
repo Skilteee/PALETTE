@@ -6,7 +6,6 @@ import subprocess
 import re
 import os
 import time
-import pdb
 
 
 def nvidia_smi_memory_info():
@@ -134,7 +133,6 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
 # forward hook
 def forward_hook_wrapper(gpu_id):
     def forward_hook(module, input, kwargs):
-        # breakpoint()
         input = tuple(_.to(f"cuda:{gpu_id}") for _ in input)
         kwargs = {
             k: v.to(f"cuda:{gpu_id}") if isinstance(v, torch.Tensor) else v

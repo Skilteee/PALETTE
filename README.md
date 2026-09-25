@@ -1,148 +1,185 @@
-# PALETTE: Per-Layer Ablation Training for Selective Safety Relaxation
+# PALETTE
 
-This repository contains the official implementation of PALETTE, a method for selectively relaxing safety refusal in large language models (LLMs) and vision-language models (VLMs) through per-layer direction ablation with LoRA.
+Code and released checkpoints for per-layer refusal-direction ablation with
+LoRA. The current release targets Llama-2-7b-chat-hf and the five GenHarm
+categories.
 
-## Overview
+## Table of Contents
 
-PALETTE trains a LoRA adapter on a single transformer layer to selectively remove the model's refusal behavior for specified "allowed" categories while preserving refusal for other harmful categories and maintaining general capabilities.
+- [Getting Started](#getting-started)
+  - [Environment Setup](#environment-setup)
+  - [Repository Layout](#repository-layout)
+  - [Data Preparation](#data-preparation)
+- [Released Artifacts](#released-artifacts)
+- [Training](#training)
+- [Evaluation](#evaluation)
+  - [Selective Refusal](#selective-refusal)
+  - [General Capabilities](#general-capabilities)
 
-**Key idea**: By identifying a *refusal direction* in the model's activation space and training a LoRA adapter to ablate this direction only for target categories, we achieve fine-grained control over which safety behaviors are relaxed.
+## Getting Started
 
-## Project Structure
+### Environment Setup
 
-```
-PALETTE/
-├── main.py                     # Training entry point
-├── ablation/
-│   └── ablation_train.py       # Core per-layer ablation training logic
-├── models/
-│   ├── LMClass.py              # LLM model wrapper
-│   └── models_utils.py         # Model utilities
-├── eval/
-│   ├── eval_refusal.py         # Evaluate selective refusal (allowed vs disallowed)
-│   ├── eval_mmlu.py            # MMLU benchmark evaluation
-│   ├── eval_gsm8k.py           # GSM8K benchmark evaluation
-│   └── eval_mmmu.py            # MMMU benchmark evaluation (VLM)
-├── utils/
-│   ├── hook_utils.py           # Direction ablation hooks
-│   ├── utils.py                # PPL evaluation, logger, grad scaler
-│   ├── datautils.py            # Data loading utilities
-│   ├── parallel_utils.py       # Multi-GPU utilities
-│   ├── dataset_utils.py        # MMMU dataset processing
-│   ├── eval_utils.py           # Evaluation judge utilities
-│   └── common_utils.py         # Common utilities
-├── data/                       # Datasets (wmdp, genharm, cosapien, etc.)
-├── data_benign.json            # Benign prompts for safe data
-└── requirements.txt
-```
-
-## Setup
+Python 3.10 and a CUDA-enabled PyTorch installation are recommended.
 
 ```bash
-# Create environment
 conda create -n palette python=3.10 -y
 conda activate palette
 
-# Install dependencies
+# Install a PyTorch build compatible with the local CUDA driver first.
+# See https://pytorch.org/get-started/locally/
 pip install -r requirements.txt
 ```
 
-### Prerequisites
+### Repository Layout
 
-1. **Refusal direction vectors**: Pre-compute refusal directions using [refusal_direction](https://github.com/andyrdt/refusal_direction) or equivalent. The output should be a `mean_diffs.pt` file with shape `[positions, layers, hidden_dim]`.
+```text
+PALETTE/
+├── main.py                         # Training entry point
+├── ablation/ablation_train.py      # Per-layer LoRA training
+├── eval/
+│   ├── eval_refusal.py             # GenHarm selective-refusal evaluation
+│   ├── eval_mmlu.py                # MMLU evaluation
+│   └── eval_gsm8k.py               # GSM8K evaluation
+├── models/                         # Model wrappers
+├── utils/                          # Hooks, data loaders, and utilities
+├── data/genharm/                   # Train/test data
+├── artifacts/Llama-2-7b-chat-hf/  # Direction tensor and released LoRAs
+├── data_benign.json                # Benign prompts used during training
+└── requirements.txt
+```
 
-2. **Datasets**: Place datasets under `./data/`:
-   - `wmdp/` — WMDP benchmark (cyber, bio, chem categories)
-   - `genharm/` — GenHarm benchmark (Violence, Hate, Sexual, etc.)
-   - `MMBench/` — MM-SafetyBench for VLM evaluation (optional)
+### Data Preparation
+
+The bundled data follows this layout:
+
+```text
+data/genharm/
+├── genharm_train.json
+├── genharm_test.json
+├── genharm_<Category>_train.json
+├── genharm_<Category>_test.json
+└── genharm_<Category>_train_dual.json
+```
+
+`<Category>` is one of `Illegal`, `Disinformation`, `Sexual`, `Hate`, or
+`Violence`. Files ending in `_train.json` are used for training and files
+ending in `_test.json` are used for evaluation. A regular record has this
+schema:
+
+```json
+{
+  "prompt": "...",
+  "category": "Hate, harassment and discrimination"
+}
+```
+
+The short target name comes from the filename. The record-level `category`
+value may be a longer descriptive label and should start with the short target
+name so that training can exclude allowed categories from the disallowed pool.
+
+The optional `_train_dual.json` files add `allowed_response` and
+`disallowed_response` fields and are used only with `--sr_ablation`.
+`genharm_train.json` supplies the disallowed training pool. Evaluation reads
+the per-category test files; `genharm_test.json` is an aggregate copy and is
+not required by the current evaluation entry point.
+
+To use another dataset, follow the same organization under
+`data/<dataset_name>/` and replace the `genharm` filename prefix with the value
+passed to `--dataset_name`.
+
+## Released Artifacts
+
+All released adapters use rank 8 and alpha 16.
+
+| Allowed category | LoRA layer | Training direction layer | Checkpoint |
+|---|---:|---:|---|
+| Illegal | 10 | 11 | `lora_layer_10_Illegal.pth` |
+| Disinformation | 13 | 14 | `lora_layer_13_Disinformation.pth` |
+| Sexual | 13 | 14 | `lora_layer_13_Sexual.pth` |
+| Hate | 14 | 15 | `lora_layer_14_Hate.pth` |
+| Violence | 14 | 15 | `lora_layer_14_Violence.pth` |
+
+The checkpoint filename and evaluation argument `--lora_layer` identify the
+layer that receives the LoRA update. During training, `--target_layer` selects
+the refusal direction and trains the preceding layer; it is therefore one
+greater than the LoRA layer.
 
 ## Training
 
-### LLM Training
+The following command trains the Hate adapter. Change `--target_types`,
+`--target_layer`, and `--output_dir` for another category.
 
 ```bash
 python main.py \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name wmdp \
-  --target_types cyber \
-  --direction_path ./directions/Llama-3.1-8B-Instruct/mean_diffs.pt \
-  --target_layer 12 \
+  --model meta-llama/Llama-2-7b-chat-hf \
+  --dataset_name genharm \
+  --target_types Hate \
+  --direction_path artifacts/Llama-2-7b-chat-hf/mean_diffs.pt \
+  --target_layer 15 \
   --direction_pos -1 \
   --ratio 1.0 1.0 1.0 \
   --epochs 20 \
-  --batch_size 16 \
+  --batch_size 8 \
   --seqlen 128 \
   --let_lr 1e-4 \
   --lora_rank 8 \
-  --lora_alpha 16.0 \
+  --lora_alpha 16 \
   --text_ablation_scale 2.5 \
-  --eval_interval 30 \
-  --output_dir ./log/llama3-cyber/
+  --eval_interval 5 \
+  --output_dir log/llama2-hate \
+  --skip_ppl_eval
 ```
 
-### VLM Training
-
-```bash
-python main.py \
-  --model Qwen/Qwen2.5-VL-7B-Instruct \
-  --task_type vision \
-  --target_types 09-Privacy_Violence \
-  --direction_path ./directions/Qwen2.5-VL-7B-Instruct/mean_diffs.pt \
-  --target_layer 17 \
-  --direction_pos -3 \
-  --ratio 1.0 0.5 1.0 \
-  --epochs 20 \
-  --seqlen_vision 384 \
-  --vision_ablation_scale 2.5 \
-  --trust_remote_code \
-  --output_dir ./log/qwen-vl-privacy/
-```
-
-
-### Key Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `--model` | HuggingFace model name or local path |
-| `--dataset_name` | Dataset: `wmdp`, `genharm`, or custom |
-| `--target_types` | Categories to allow (space-separated) |
-| `--direction_path` | Path to pre-computed `mean_diffs.pt` |
-| `--target_layer` | Layer index for ablation |
-| `--direction_pos` | Token position in direction tensor (e.g., -1 for last) |
-| `--text_ablation_scale` | Ablation strength for LLM |
-| `--vision_ablation_scale` | Ablation strength for VLM |
-| `--ratio` | Data ratio: [allowed, disallowed, safe] |
+The selected adapter is written to
+`log/llama2-hate/lora_layer_14_Hate.pth`.
 
 ## Evaluation
 
-### Selective Refusal Evaluation
+### Selective Refusal
 
-Evaluate whether the model correctly responds to allowed prompts and refuses disallowed ones:
+Evaluate a released adapter on the GenHarm test split:
 
 ```bash
 python eval/eval_refusal.py \
-  --model_id meta-llama/Llama-3.1-8B-Instruct \
-  --lora_path ./log/llama3-cyber/best_lora_layer_11.pth \
-  --lora_layer 11 \
-  --dataset_name wmdp \
-  --disallow_datasets chem,bio \
-  --eval_mode ablation
+  --model_id meta-llama/Llama-2-7b-chat-hf \
+  --lora_path artifacts/Llama-2-7b-chat-hf/lora_layer_14_Hate.pth \
+  --lora_layer 14 \
+  --dataset_name genharm \
+  --dataset_split test \
+  --allow_datasets Hate \
+  --disallow_datasets Illegal,Sexual,Disinformation,Violence \
+  --eval_mode ablation \
+  --eval_batch_size 8 \
+  --limit 200 \
+  --device cuda:0
 ```
 
-### General Capability Benchmarks
+For a different adapter, use the category and layer from the artifact table,
+put that category in `--allow_datasets`, and list the other four categories in
+`--disallow_datasets`.
+
+The evaluator reports allowed-category response accuracy, disallowed-category
+refusal accuracy, overall accuracy, recall, and F1. Refusal is detected with a
+keyword heuristic defined in `eval/eval_refusal.py`.
+
+### General Capabilities
+
+Installations using these evaluators also require `lm-eval`, which is included
+in `requirements.txt`.
 
 ```bash
 # MMLU
 python eval/eval_mmlu.py \
-  --model_name meta-llama/Llama-3.1-8B-Instruct \
-  --lora_path ./log/llama3-cyber/best_lora_layer_11.pth \
-  --lora_layer 11 \
+  --model_name meta-llama/Llama-2-7b-chat-hf \
+  --lora_path artifacts/Llama-2-7b-chat-hf/lora_layer_14_Hate.pth \
+  --lora_layer 14 \
   --tasks mmlu
 
 # GSM8K
 python eval/eval_gsm8k.py \
-  --base_model meta-llama/Llama-3.1-8B-Instruct \
-  --lora_path ./log/llama3-cyber/best_lora_layer_11.pth \
-  --lora_layer 11 \
+  --base_model meta-llama/Llama-2-7b-chat-hf \
+  --lora_path artifacts/Llama-2-7b-chat-hf/lora_layer_14_Hate.pth \
+  --lora_layer 14 \
   --tasks gsm8k
 ```

@@ -1,27 +1,17 @@
 ﻿import argparse, json, os, re
-import code
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from PIL import Image
-from utils.utils import evaluate as evaluate_wiki
-
 import torch
-from harm_detector import HarmfulBehaviorDetector
-from peft import PeftModel
-import sys
-import datetime
-import random
 from collections import defaultdict
-from utils.hook_utils import (
-    add_hooks,
-    get_direction_ablation_input_pre_hook,
-    get_direction_ablation_output_hook,
-)
-import re
+from utils.hook_utils import add_hooks
 
 
 key_words = set(("I'm sorry",
@@ -114,18 +104,6 @@ def is_refusal(text: str, is_qwen=False) -> bool:
     return False
 
 
-LLAMA2_CHAT_TEMPLATE_WITH_SYSTEM = "<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{instruction} [/INST] "
-LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM = (
-    "<|begin_of_text|>"
-    "<|start_header_id|>system<|end_header_id|>\n"
-    "{system_prompt}"
-    "<|eot_id|>"
-    "<|start_header_id|>user<|end_header_id|>\n"
-    "{instruction}"
-    "<|eot_id|>"
-    "<|start_header_id|>assistant<|end_header_id|>\n"
-)
-
 DEFAULT_SYSTEM_PROMPT = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
 
 
@@ -138,38 +116,7 @@ def apply_chat_template(tokenizer, user_text: str, system_prompt: str = DEFAULT_
             {"role": "user", "content": user_text},
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-# def apply_chat_template(user_text: str, model_name, system_prompt="Below is an instruction that describes a task. Write a response that appropriately completes the request.") -> str:
-#
-#     if 'llama-3.1' in model_name.lower():
-#         return LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM.format(instruction=user_text, system_prompt=system_prompt)
-#     else:
-#         return LLAMA2_CHAT_TEMPLATE_WITH_SYSTEM.format(instruction=user_text, system_prompt=system_prompt)
-
-
-def parse_layer_spec(layer_spec: str, num_layers: int):
-    if layer_spec is None:
-        return set()
-    spec = str(layer_spec).strip().lower()
-    if spec in ("", "none"):
-        return set()
-    if spec == "all":
-        return set(range(num_layers))
-    layers = set()
-    for piece in str(layer_spec).split(","):
-        piece = piece.strip()
-        if piece:
-            layers.add(int(piece))
-    return layers
-
-
-def parse_int_list(spec: str):
-    if spec is None:
-        return []
-    s = str(spec).strip().lower()
-    if s in ("", "none"):
-        return []
-    return [int(x.strip()) for x in str(spec).split(",") if x.strip()]
+    return f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_text} [/INST] "
 
 
 def get_transformer_layers(model):
@@ -194,34 +141,6 @@ def get_language_transformer_layers(model):
     return get_transformer_layers(model)
 
 
-def select_direction_vector(direction_tensor: torch.Tensor, pos: int, layer: int) -> torch.Tensor:
-    if direction_tensor.ndim == 3:
-        return direction_tensor[pos, layer, :]
-    if direction_tensor.ndim == 2:
-        return direction_tensor[layer, :]
-    if direction_tensor.ndim == 1:
-        return direction_tensor
-    raise ValueError(f"Unsupported direction tensor shape: {tuple(direction_tensor.shape)}")
-
-
-def build_ablation_hooks(model, selected_layers, default_direction=None, layer_directions=None):
-    layers = get_transformer_layers(model)
-    fwd_pre_hooks = []
-    layer_directions = layer_directions or {}
-
-    for layer_idx in sorted(selected_layers):
-        block = layers[layer_idx]
-        if not hasattr(block, "self_attn") or not hasattr(block, "mlp"):
-            continue
-        direction = layer_directions.get(layer_idx, default_direction)
-        if direction is None:
-            continue
-        fwd_pre_hooks.append((block, get_direction_ablation_input_pre_hook(direction=direction)))
-
-    return fwd_pre_hooks,
-
-
-
 @torch.no_grad()
 def generate_batch(model, tokenizer, prompts, args, fwd_pre_hooks=None, fwd_hooks=None):
     prompt_texts = [apply_chat_template(tokenizer, prompt, args.system_prompt) for prompt in prompts]
@@ -230,74 +149,45 @@ def generate_batch(model, tokenizer, prompts, args, fwd_pre_hooks=None, fwd_hook
         return_tensors="pt",
         padding=True,
         truncation=True,
-    ).to('cuda:0')
+    ).to(args.device)
     fwd_pre_hooks = fwd_pre_hooks or []
     fwd_hooks = fwd_hooks or []
     hook_ctx = add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks) if (fwd_pre_hooks or fwd_hooks) else nullcontext()
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    device_type = torch.device(args.device).type
+    autocast_ctx = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device_type == "cuda"
+        else nullcontext()
+    )
+    with autocast_ctx:
         with hook_ctx:
             gen_out = model.generate(
                 **inputs,
-                max_new_tokens=16,
+                max_new_tokens=args.max_new_tokens,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=True,
             )
-    return tokenizer.batch_decode(gen_out)
-
-
-def create_data(datasets, limit):
-    data = []
-    ds = load_dataset(datasets)["test"] if "test" in load_dataset(datasets) else load_dataset(datasets)[
-        "train"]
-    n = len(ds) if limit is None else min(limit, len(ds))
-    for i in range(n):
-        rec = ds[i]
-        data.append(rec)
-
-    with open('data.json', 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-def balanced_sample_indices(labels, seed=None):
-    if seed is not None:
-        random.seed(seed)
-
-    label_to_indices = defaultdict(list)
-    for idx, label in enumerate(labels):
-        label_to_indices[label].append(idx)
-
-    min_count = min(len(indices) for indices in label_to_indices.values())
-
-    sampled_indices = []
-    for label, indices in label_to_indices.items():
-        sampled_indices.extend(random.sample(indices, min_count))
-
-    random.shuffle(sampled_indices)
-
-    return sampled_indices
+    generated = gen_out[:, inputs.input_ids.shape[1]:]
+    return tokenizer.batch_decode(generated, skip_special_tokens=True)
 
 
 def iter_prompts(dataset_path: str, limit):
-
-
-
     prompts = []
     labels = []
-    # dataset_path = "data_tmp.json"
     if os.path.isfile(dataset_path):
         with open(dataset_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-            for obj in data[:limit]:
+            records = data if limit is None or limit < 0 else data[:limit]
+            for obj in records:
                 prompt = obj.get("prompt") or obj.get("instruction") or obj.get("input") or obj.get("question") or ""
                 prompts.append(prompt)
                 labels.append('allowed')
 
     else:
-        ds = load_dataset(dataset_path)["test"] if "test" in load_dataset(dataset_path) else load_dataset(dataset_path)["train"]
-        # ds = load_dataset(dataset_path)['30k_train']
-        # ds = [each for each in ds if each['is_safe'] == False]
-        n = len(ds) if limit is None else min(limit, len(ds))
+        loaded = load_dataset(dataset_path)
+        ds = loaded["test"] if "test" in loaded else loaded["train"]
+        n = len(ds) if limit is None or limit < 0 else min(limit, len(ds))
         for i in range(n):
             rec = ds[i]
             prompt = rec.get("prompt") or rec.get("instruction") or rec.get("input") or ""
@@ -313,29 +203,17 @@ def parse_dataset_list(dataset_arg: str):
         return []
     return [x.strip() for x in dataset_arg.split(",") if x.strip()]
 
-def load_cosapien(category, label):
-    tmp_data = []
-    with open(f'/home/qitao/ptq_align/data/cosapien/{category}.json', 'r', encoding='utf-8') as f:
-        data = json.load(f)
 
-        for each in data:
-            if each['type'] == label:
-                prompt = each.get("prompt")
-                tmp_data.append((prompt, label, category))
-    return tmp_data
-
-
-def load_labeled_data(dataset_name, category, limit, label):
+def load_labeled_data(dataset_name, category, limit, label, split="test"):
     data = []
-
-    if dataset_name == 'cosapien':
-        data.extend(load_cosapien(category[0], label))
-
-    else:
-        for dataset_path in category:
-            prompts, _ = iter_prompts("./data/{}/{}_{}_train.json".format(dataset_name, dataset_name, dataset_path), limit)
-            subcategory = dataset_path
-            data.extend([(prompt, label, subcategory) for prompt in prompts])
+    for dataset_path in category:
+        prompts, _ = iter_prompts(
+            "./data/{}/{}_{}_{}.json".format(
+                dataset_name, dataset_name, dataset_path, split
+            ),
+            limit,
+        )
+        data.extend([(prompt, label, dataset_path) for prompt in prompts])
     return data
 
 
@@ -437,14 +315,13 @@ def build_vision_eval_items(args):
         else:
             disallowed_categories = [c for c in all_categories if c != args.vision_allowed_category]
 
-        # selected_categories = [args.vision_allowed_category] + disallowed_categories
-        selected_categories = [args.vision_allowed_category]
+        selected_categories = [args.vision_allowed_category] + disallowed_categories
         items = []
         for category in selected_categories:
             label = "allowed" if category == args.vision_allowed_category else "disallowed"
             qa_path = questions_dir / f"{category}_{args.vision_split}.json"
             qa_items = load_vision_questions(str(qa_path))
-            if args.limit is not None:
+            if args.limit is not None and args.limit >= 0:
                 qa_items = qa_items[:args.limit]
             for sample in qa_items:
                 img_path = resolve_vision_image_path(sample, args, category)
@@ -458,7 +335,7 @@ def build_vision_eval_items(args):
         return items
 
     qa_items = load_vision_questions(args.vision_qa_json)
-    if args.limit is not None:
+    if args.limit is not None and args.limit >= 0:
         qa_items = qa_items[:args.limit]
     items = []
     for sample in qa_items:
@@ -504,7 +381,6 @@ def generate_vision_batch(model, processor, batch_items, args, fwd_pre_hooks=Non
         return_tensors="pt",
         padding=True,
         padding_side='left',
-        # max_length=384,
     ).to(model.device)
 
 
@@ -719,7 +595,8 @@ def evaluate(model, tokenizer, data, args, mapping, fwd_pre_hooks=None, fwd_hook
     }
     eval_batch_size = getattr(args, "eval_batch_size", 8)
 
-    is_qwen = "qwen" in model.config.architectures[0].lower()
+    architectures = getattr(model.config, "architectures", None) or []
+    is_qwen = any("qwen" in architecture.lower() for architecture in architectures)
 
     for start in tqdm(range(0, len(data), eval_batch_size), desc="Evaluating"):
         batch = data[start:start + eval_batch_size]
@@ -831,15 +708,25 @@ def _merge_lora_into_params(param_dict, buffer_dict, state_dict, lora_rank, lora
     if not linear_prefixes:
         raise ValueError("No LoRA weights found in the provided checkpoint")
 
+    missing = []
     with torch.no_grad():
         for prefix in linear_prefixes:
             weight_key = f"{prefix}.weight"
             if weight_key not in param_dict:
+                missing.append(weight_key)
                 continue
             lora_a = state_dict[f"{prefix}.lora_A"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
             lora_b = state_dict[f"{prefix}.lora_B"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
+            if lora_a.shape[0] != lora_rank or lora_b.shape[1] != lora_rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {prefix}: checkpoint rank "
+                    f"{lora_a.shape[0]}, requested rank {lora_rank}"
+                )
             delta = torch.matmul(lora_b, lora_a) * scaling
             param_dict[weight_key].add_(delta)
+
+        if missing:
+            raise KeyError(f"LoRA keys do not match the target layer: {missing}")
 
         for key, value in state_dict.items():
             if key.endswith(".lora_A") or key.endswith(".lora_B") or ".base_layer." in key:
@@ -857,62 +744,46 @@ def merge_lora_layer(layer, layer_state_dict, lora_rank, lora_alpha):
     _merge_lora_into_params(layer_params, layer_buffers, state_dict, lora_rank, lora_alpha)
 
 
-def merge_lora_model(model, model_state_dict, lora_rank, lora_alpha):
-    state_dict = _unwrap_state_dict(model_state_dict)
-    model_params = dict(model.named_parameters())
-    model_buffers = dict(model.named_buffers())
-    _merge_lora_into_params(model_params, model_buffers, state_dict, lora_rank, lora_alpha)
-
-
 def main():
     parser = argparse.ArgumentParser()
-    # TheBloke/Llama-2-7B-Chat-AWQ
-    parser.add_argument("--model_id", type=str,
-                        # default="google/gemma-2-9b-it",
-                        # default="google/gemma-3-4b-it",
-                        # default="Qwen/Qwen2.5-7B-Instruct",
-                        # default="meta-llama/Llama-2-7b-chat-hf",
-                        default="meta-llama/Llama-3.1-8B-Instruct"
-                        # default="Qwen/Qwen2.5-14B-Instruct",
-                        # default="Qwen/Qwen2.5-VL-7B-Instruct",
-                        )
+    parser.add_argument(
+        "--model_id",
+        type=str,
+        default="meta-llama/Llama-2-7b-chat-hf",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
-        default='./data/genharm_Disinformation_test.json',
-        help="AdvBench harmful data source (json file path or datasets name)",
+        default=None,
+        help="JSON file path or Hugging Face dataset name",
     )
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.95)
-    parser.add_argument("--top_p", type=float, default=0.7)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--device", type=str, default='cuda:0')
-    parser.add_argument("--ptst", type=bool, default=False)
     parser.add_argument(
         "--allow_datasets",
         type=str,
-        # default="book_publisher_arab",
-        # default='cyber',
-        # default="",
-        # default="Sexual",
         help="comma-separated dataset paths for allow/safe prompts",
     )
     parser.add_argument(
         "--disallow_datasets",
         type=str,
-        # default="book_publisher_arab",
-        default="Illegal,Sexual,Disinformation,Hate,Violence",
-        # default="",
-        # default="Sexual,Illegal,Hate",
-        # default='chem,bio,cyber',
+        default=None,
         help="comma-separated dataset paths for disallow prompts",
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
         default='genharm',
-        help="comma-separated dataset paths for disallow prompts",
+        help="dataset directory and filename prefix under ./data",
+    )
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="test",
+        choices=["train", "test"],
+        help="Split used with --allow_datasets/--disallow_datasets (default: test).",
     )
     parser.add_argument(
         "--dataset_label",
@@ -927,39 +798,16 @@ def main():
         default="fp",
         choices=["fp", "ablation"],
     )
-    parser.add_argument("--w_biits", type=int, default=8)
-    parser.add_argument("--a_bits", type=int, default=8)
-    parser.add_argument(
-        "--direction_path",
-        type=str,
-        default="../refusal_direction/runs/Llama-2-7b-chat-hf/generate_directions/mean_diffs.pt",
-    )
-    parser.add_argument("--direction_pos", type=int, default=-5)
-    parser.add_argument("--direction_layer", type=int, default=14)
-    parser.add_argument(
-        "--ablation_layers",
-        type=str,
-        default="12",
-        help="comma-separated layer ids, 'all', or 'none'; only used in ablation mode",
-    )
     parser.add_argument(
         "--lora_path",
         type=str,
-        default="./log/Qwen2.5-7B-Instruct/best_lora_sft_violence.pth",
-        # default="./log/Llama-2-7b-chat-hf/best_lora_layer_14_Hate.pth",
-        help="comma-separated layer ids, 'all', or 'none'; only used in ablation mode",
+        default=None,
+        help="LoRA checkpoint to merge; required when --eval_mode ablation",
     )
     parser.add_argument(
         "--lora_layer",
         type=int,
         default=14,
-    )
-    parser.add_argument(
-        "--lora_scope",
-        type=str,
-        default="layer",
-        choices=["layer", "model"],
-        help="layer: merge LoRA checkpoint into --lora_layer only; model: merge LoRA checkpoint into whole model.",
     )
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=float, default=16.0)
@@ -975,8 +823,7 @@ def main():
     parser.add_argument("--vision_questions_dir", type=str, default="./data/MMBench/processed_questions")
     parser.add_argument("--vision_images_root", type=str, default="./data/MMBench/MM-SafetyBench(imgs)")
     parser.add_argument("--vision_image_subdir", type=str, default="SD")
-    parser.add_argument("--vision_split", type=str, default="train", choices=["train", "test"])
-    # all_categories = ['01-Illegal_Activity','02-HateSpeech', '04-Physical_Harm', '06-Fraud', '07-Sex', '09-Privacy_Violence']
+    parser.add_argument("--vision_split", type=str, default="test", choices=["train", "test"])
     parser.add_argument("--vision_allowed_category", type=str, default='07-Sex')
     parser.add_argument("--vision_disallowed_categories", type=str, default="")
     parser.add_argument("--vision_dataset_label", type=str, default="disallowed", choices=["allowed", "safe", "disallowed"])
@@ -1000,10 +847,12 @@ def main():
 
     processor = None
     if args.task_type == "vision":
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
         model = AutoModelForImageTextToText.from_pretrained(
             args.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            dtype=torch.bfloat16,
+            device_map={"": args.device},
             trust_remote_code=args.trust_remote_code,
         )
         processor = AutoProcessor.from_pretrained(
@@ -1014,8 +863,8 @@ def main():
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            dtype=torch.bfloat16,
+            device_map={"": args.device},
         )
 
     for param in model.parameters():
@@ -1025,27 +874,22 @@ def main():
     fwd_hooks = []
     layers = get_transformer_layers(model)
     if args.eval_mode == "ablation":
+        if not args.lora_path:
+            parser.error("--lora_path is required when --eval_mode ablation")
         layers = model.model.language_model.layers if args.task_type == "vision" else layers
-        lora_state = torch.load(args.lora_path, map_location=args.device)
-        if args.lora_scope == "model":
-            merge_lora_model(
-                model,
-                lora_state,
-                args.lora_rank,
-                args.lora_alpha,
+        lora_state = torch.load(args.lora_path, map_location="cpu", weights_only=True)
+        if not 0 <= args.lora_layer < len(layers):
+            raise ValueError(
+                f"--lora_layer must be in [0, {len(layers) - 1}], "
+                f"got {args.lora_layer}"
             )
-        else:
-            merge_lora_layer(
-                layers[13],
-                lora_state,
-                args.lora_rank,
-                args.lora_alpha,
-            )
+        merge_lora_layer(
+            layers[args.lora_layer],
+            lora_state,
+            args.lora_rank,
+            args.lora_alpha,
+        )
 
-
-    # best_eval_results = evaluate_wiki(model, args.model_id)
-
-    # model = model.cuda()
     if args.task_type == "vision":
         eval_stats = evaluate_vision(model, processor, args, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks)
         print("\n=== Vision Evaluation Summary ===")
@@ -1096,11 +940,15 @@ def main():
 
         allow_datasets = parse_dataset_list(args.allow_datasets)
         disallow_datasets = parse_dataset_list(args.disallow_datasets)
-        data = [('Give three tips for staying healthy.','Sexual','allowed')]
+        data = []
 
         if allow_datasets or disallow_datasets:
-            data.extend(load_labeled_data(args.dataset_name, disallow_datasets, args.limit, "disallowed"))
-            data.extend(load_labeled_data(args.dataset_name, allow_datasets, args.limit, "allowed"))
+            data.extend(load_labeled_data(
+                args.dataset_name, disallow_datasets, args.limit, "disallowed", args.dataset_split
+            ))
+            data.extend(load_labeled_data(
+                args.dataset_name, allow_datasets, args.limit, "allowed", args.dataset_split
+            ))
         elif args.dataset:
             prompts, _ = iter_prompts(args.dataset, args.limit)
             data.extend([(prompt, args.dataset_label) for prompt in prompts])
@@ -1146,17 +994,5 @@ def main():
                 print(f"{category:12s}: accuracy={accuracy:.4f} ({success_num}/{total_num})")
         print("================================\n")
 
-
 if __name__ == "__main__":
-    # CUDA_VISIBLE_DEVICES=2 python attack_test.py --resume /home/Qitao/project/ptq_align/fine-tuning/checkpoint/sft-llama-2-7b-chat-hf-sst2-hr0.1/checkpoint-9261
-
     main()
-
-
-
-
-
-
-
-
-

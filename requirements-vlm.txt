@@ -1,0 +1,6 @@
+-r requirements.txt
+pandas>=2.0.0
+packaging>=23.0
+requests>=2.31.0
+vllm>=0.7.0
+qwen-vl-utils>=0.0.14

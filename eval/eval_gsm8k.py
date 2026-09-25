@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
 
-import lm_eval
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import torch
-from lm_eval.models.huggingface import HFLM
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -23,15 +25,25 @@ def _merge_lora_into_params(param_dict, buffer_dict, state_dict, lora_rank, lora
     if not linear_prefixes:
         raise ValueError("No LoRA weights found in the provided checkpoint")
 
+    missing = []
     with torch.no_grad():
         for prefix in linear_prefixes:
             weight_key = f"{prefix}.weight"
             if weight_key not in param_dict:
+                missing.append(weight_key)
                 continue
             lora_a = state_dict[f"{prefix}.lora_A"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
             lora_b = state_dict[f"{prefix}.lora_B"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
+            if lora_a.shape[0] != lora_rank or lora_b.shape[1] != lora_rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {prefix}: checkpoint rank "
+                    f"{lora_a.shape[0]}, requested rank {lora_rank}"
+                )
             delta = torch.matmul(lora_b, lora_a) * scaling
             param_dict[weight_key].add_(delta)
+
+        if missing:
+            raise KeyError(f"LoRA keys do not match the target layer: {missing}")
 
 
 def merge_lora_layer(layer, layer_state_dict, lora_rank, lora_alpha):
@@ -62,21 +74,28 @@ def main():
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--tasks", type=str, default="gsm8k")
     parser.add_argument("--limit", type=float, default=None)
-    parser.add_argument("--apply_chat_template", action="store_true", default=True)
+    parser.add_argument(
+        "--apply_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--output_path", type=str, default="")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = parser.parse_args()
+
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, torch_dtype=dtype_map[args.dtype], device_map="auto",
+        args.base_model, dtype=dtype_map[args.dtype], device_map="auto",
     )
 
     if args.lora_path and args.lora_layer is not None:
         layers = get_transformer_layers(model)
-        lora_state = torch.load(args.lora_path, map_location="cpu")
+        lora_state = torch.load(args.lora_path, map_location="cpu", weights_only=True)
         merge_lora_layer(layers[args.lora_layer], lora_state, args.lora_rank, args.lora_alpha)
 
     for param in model.parameters():

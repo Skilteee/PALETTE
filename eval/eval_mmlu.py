@@ -1,5 +1,8 @@
-from lm_eval.models.huggingface import HFLM
-import lm_eval
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -24,15 +27,25 @@ def _merge_lora_into_params(param_dict, buffer_dict, state_dict, lora_rank, lora
     if not linear_prefixes:
         raise ValueError("No LoRA weights found in the provided checkpoint")
 
+    missing = []
     with torch.no_grad():
         for prefix in linear_prefixes:
             weight_key = f"{prefix}.weight"
             if weight_key not in param_dict:
+                missing.append(weight_key)
                 continue
             lora_a = state_dict[f"{prefix}.lora_A"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
             lora_b = state_dict[f"{prefix}.lora_B"].to(device=param_dict[weight_key].device, dtype=param_dict[weight_key].dtype)
+            if lora_a.shape[0] != lora_rank or lora_b.shape[1] != lora_rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {prefix}: checkpoint rank "
+                    f"{lora_a.shape[0]}, requested rank {lora_rank}"
+                )
             delta = torch.matmul(lora_b, lora_a) * scaling
             param_dict[weight_key].add_(delta)
+
+        if missing:
+            raise KeyError(f"LoRA keys do not match the target layer: {missing}")
 
         for key, value in state_dict.items():
             if key.endswith(".lora_A") or key.endswith(".lora_B") or ".base_layer." in key:
@@ -74,15 +87,18 @@ def main():
     parser.add_argument("--apply_chat_template", action="store_true", default=False)
     args = parser.parse_args()
 
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.bfloat16, device_map="auto"
+        args.model_name, dtype=torch.bfloat16, device_map="auto"
     )
     model.eval()
 
     if args.lora_path and args.lora_layer is not None:
         layers = get_transformer_layers(model)
-        lora_state = torch.load(args.lora_path, map_location="cpu")
+        lora_state = torch.load(args.lora_path, map_location="cpu", weights_only=True)
         merge_lora_layer(layers[args.lora_layer], lora_state, args.lora_rank, args.lora_alpha)
 
     for param in model.parameters():
