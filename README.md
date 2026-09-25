@@ -1,6 +1,7 @@
 # PALETTE
 
 This repository contains the official implementation of PALETTE, a method for selectively relaxing safety refusal in large language models (LLMs) and vision-language models (VLMs) through per-layer direction ablation with LoRA.
+The repository also includes the Llama-3.1-8B-Instruct refusal-direction tensor.
 
 ## Table of Contents
 
@@ -42,7 +43,9 @@ PALETTE/
 ├── models/                         # Model wrappers
 ├── utils/                          # Hooks, data loaders, and utilities
 ├── data/genharm/                   # Train/test data
-├── artifacts/Llama-2-7b-chat-hf/  # Direction tensor and released LoRAs
+├── artifacts/
+│   ├── Llama-2-7b-chat-hf/        # Direction tensor and released LoRAs
+│   └── Llama-3.1-8B-Instruct/     # Direction tensor
 ├── data_benign.json                # Benign prompts used during training
 └── requirements.txt
 ```
@@ -88,7 +91,15 @@ passed to `--dataset_name`.
 
 ## Released Artifacts
 
-All released adapters use rank 8 and alpha 16.
+Bundled refusal-direction tensors:
+
+| Model | File | Shape |
+|---|---|---:|
+| Llama-2-7b-chat-hf | `artifacts/Llama-2-7b-chat-hf/mean_diffs.pt` | `[6, 32, 4096]` |
+| Llama-3.1-8B-Instruct | `artifacts/Llama-3.1-8B-Instruct/mean_diffs.pt` | `[5, 32, 4096]` |
+
+Released LoRA adapters are currently provided only for Llama-2. All adapters
+use rank 8 and alpha 16.
 
 | Allowed category | LoRA layer | Training direction layer | Checkpoint |
 |---|---:|---:|---|
