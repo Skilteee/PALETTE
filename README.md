@@ -5,9 +5,9 @@ The repository also includes the Llama-3.1-8B-Instruct refusal-direction tensor.
 
 ## News
 
-[2026/02] The codebase is open-sourced.
+[2026/09] The codebase is open-sourced.
 
-[2026/02] Palette is accepted to Neurips 2026.
+[2026/09] Palette is accepted to Neurips 2026.
 
 ## Table of Contents
 
