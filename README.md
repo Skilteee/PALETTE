@@ -3,6 +3,12 @@
 This repository contains the official implementation of PALETTE, a method for selectively relaxing safety refusal in large language models (LLMs) and vision-language models (VLMs) through per-layer direction ablation with LoRA.
 The repository also includes the Llama-3.1-8B-Instruct refusal-direction tensor.
 
+## News
+
+[2026/02] The codebase is open-sourced.
+
+[2026/02] Palette is accepted to Neurips 2026.
+
 ## Table of Contents
 
 - [Getting Started](#getting-started)
